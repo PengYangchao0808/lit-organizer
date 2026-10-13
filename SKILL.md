@@ -518,241 +518,46 @@ if new_path.exists() and new_path != old_path:
 
 ---
 
-## 完整执行脚本模板
+## 执行入口（硬约束 · 必须遵守）
 
-> **权威版本在 `scripts/rename.py`（含 sidecar 消费、文件名回退、幂等保护、--dry-run/--force，以它为准）**。以下内联模板仅供理解逻辑与自定义改造。
+**本 skill 的执行入口只有以下两个固定脚本。禁止为本 skill 的流程新建临时脚本（不许写 /tmp/lit_organizer.py、dl_browser.py 之类的一次性轮子）：**
 
-将以下脚本保存为 `/tmp/lit_organizer.py` 并执行：
+| 阶段 | 固定脚本 | 说明 |
+|------|---------|------|
+| Phase 0 下载 | `scripts/download.py` | DOI → PDF + 元数据 sidecar，Sci-Hub 链 + OA 回退 |
+| Phase 1+3 重命名 | `scripts/rename.py` | sidecar → 关键词重命名，`--dry-run` / `--force` |
 
-```python
-#!/usr/bin/env python3
-"""Literature Organizer: Extract, Classify, Rename."""
-
-import os, re, json, shutil
-from pathlib import Path
-from collections import Counter
-import PyPDF2
-
-# ============ CONFIG ============
-PDF_DIR = Path("TARGET_DIRECTORY_HERE")  # 修改为目标目录
-MAX_PAGES = 3
-# ================================
-
-def extract_text(pdf_path, max_pages=3):
-    try:
-        with open(pdf_path, 'rb') as f:
-            reader = PyPDF2.PdfReader(f)
-            return "\n".join(
-                page.extract_text() or ""
-                for i, page in enumerate(reader.pages)
-                if i < max_pages
-            )
-    except Exception as e:
-        return ""
-
-def extract_author(text):
-    """Extract corresponding author marked with asterisk (*)."""
-    for line in text.split('\n'):
-        # Pattern: "Name*" or "Name1,2*"
-        m = re.search(r'([A-Z][a-z]+(?:\s+[A-Z]\.?\s*)*(?:\s+[A-Z][a-z]+)*)\s*\d*,?\d*\s*\*$', line)
-        if m:
-            return m.group(1).strip()
-    # Fallback: email
-    m = re.search(r'E-mail\s*:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+)', text)
-    if m:
-        username = m.group(1).split('@')[0]
-        return re.sub(r'[^a-zA-Z]', '', username).capitalize()
-    return None
-
-def extract_year(text):
-    for p in [r'(\d{4})\s*©', r'\((\d{4})\)', r'©\s*(\d{4})']:
-        m = re.search(p, text)
-        if m and 1900 <= int(m.group(1)) <= 2025:
-            return m.group(1)
-    return None
-
-def extract_journal(text):
-    JMAP = {
-        r'Angew\s*Chem\s*Int\s*Ed': 'Angew Chem Int Ed',
-        r'Nature': 'Nature',
-        r'JACS': 'JACS',
-        r'Org\s*Lett': 'Org Lett',
-        r'Chem\s*Commun': 'Chem Commun',
-        r'Chem\s*Sci': 'Chem Sci',
-        r'Org\s*Biomol\s*Chem': 'Org Biomol Chem',
-        r'Org\s*Chem\s*Front': 'Org Chem Front',
-    }
-    for pat, abbr in JMAP.items():
-        if re.search(pat, text[:2000], re.IGNORECASE):
-            return abbr
-    return None
-
-def extract_title(text):
-    for line in text.split('\n'):
-        line = line.strip()
-        skip = ['received', 'published', 'doi:', 'copyright', 'abstract',
-                'corresponding', 'e-mail', 'supporting']
-        if len(line) > 15 and len(line) < 200:
-            if not any(s in line.lower() for s in skip):
-                if line != line.upper() and line != line.lower():
-                    return re.sub(r'[^\w\s-]', '', line).strip()
-    return None
-
-def normalize_chemistry(text):
-    """化学字符归一化：下标数字/希腊字母/中点 → ASCII（须在清洗前调用）。"""
-    trans = str.maketrans('₀₁₂₃₄₅₆₇₈₉⁰¹²³⁴⁵⁶⁷⁸⁹', '01234567890123456789')
-    text = text.translate(trans)
-    for k, v in {'α': 'alpha', 'β': 'beta', 'γ': 'gamma', 'δ': 'delta',
-                 'ε': 'epsilon', 'μ': 'mu', 'Δ': 'Delta', 'Ω': 'Omega',
-                 'σ': 'sigma'}.items():
-        text = text.replace(k, v)
-    return text.replace('·', ' ').replace('•', ' ')
-
-STOPWORDS = {'a', 'an', 'the', 'of', 'in', 'on', 'to', 'towards', 'toward',
-             'with', 'via', 'for', 'and', 'or', 'by', 'from', 'under',
-             'into', 'involving', 'using', 'between', 'is', 'are', 'at', 'as',
-             'very', 'remarkably', 'completely', 'efficiently', 'highly'}
-
-def extract_keywords(title, max_words=6):
-    """标题 → 3-6 个关键词：第一子句 + 去停用词 + 连字符化合物整体保留。"""
-    clause = title.split('. ')[0].rstrip('.,;:')
-    clause = normalize_chemistry(clause)
-    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-']*", clause)
-    words = [t for t in tokens if t.lower() not in STOPWORDS] or tokens
-    return words[:max_words]
-
-def clean(s, max_len=80):
-    """清洗单字段。标题长度由 extract_keywords 词数控制，此处仅兜底。"""
-    if not s: return "Unknown"
-    s = re.sub(r'[^\w\s-]', '', s)
-    s = re.sub(r'\s+', '_', s)
-    s = re.sub(r'_+', '_', s).strip('_')
-    return s[:max_len].rsplit('_', 1)[0] if len(s) > max_len else s
-
-# ============ MAIN ============
-pdfs = list(PDF_DIR.glob("**/*.pdf"))
-results = []
-for pdf in pdfs:
-    # 幂等保护：已符合 YYYY_ 开头四段式命名的文件跳过，
-    # 防止重跑时启发式关键词覆盖人工复核优化过的名字（需强制处理时手动注释此行）
-    if re.match(r'^\d{4}_[A-Za-z][A-Za-z0-9\-]*_.+_.+\.pdf$', pdf.name):
-        print(f"SKIP (normalized): {pdf.name}")
-        continue
-    text = extract_text(pdf)
-    year = extract_year(text) or "Unknown"
-    author = extract_author(text) or "Unknown"
-    journal = extract_journal(text) or "Unknown"
-    title = extract_title(text) or "Unknown"
-    # 标题 → 关键词式（归一化内置于 extract_keywords）
-    kws = extract_keywords(title)
-    title_part = '_'.join(clean(w) for w in kws) if kws else "Unknown"
-    new_name = f"{clean(year)}_{clean(author)}_{clean(journal)}_{title_part}.pdf"
-    new_path = pdf.parent / new_name
-    if new_path.exists() and new_path != pdf:
-        base, c = new_path.stem, 1
-        while new_path.exists():
-            new_path = pdf.parent / f"{base}_{c}.pdf"; c += 1
-    pdf.rename(new_path)
-    results.append({"old": pdf.name, "new": new_path.name, "year": year,
-                     "author": author, "journal": journal, "title": title})
-    print(f"OK: {pdf.name} -> {new_path.name}")
-
-# Save log
-log_path = PDF_DIR / "rename_log.json"
-with open(log_path, "w", encoding="utf-8") as f:
-    json.dump(results, f, indent=2, ensure_ascii=False)
-print(f"\nDone. {len(results)} files processed. Log: {log_path}")
+```bash
+SKILL=~/.config/opencode/skills/lit-organizer/scripts
+python3 $SKILL/download.py --file dois.txt --out ./papers && \
+python3 $SKILL/rename.py --dir ./papers
 ```
 
-### 带分类的完整脚本
+**停止规则（失败时的行为，优先级最高）：**
 
-如果需要同时执行分类，将以下脚本保存为 `/tmp/lit_organizer_classify.py`：
+1. **管线内失败**（镜像全部 challenge / PMC reCAPTCHA 冷却 / 查无 OA 副本）→ 最多重试 1 次，然后**输出失败报告并询问用户**；禁止转即兴写脚本继续抓
+2. **超出本 skill 范围**（SI 附件、figshare 数据文件、2022+ 无 OA 新文献、机构权限墙）→ 直接向用户报告已知链接清单与阻塞原因，不要用 playwright/curl 现场造轮子
+3. **需要扩展** → 直接修改 `scripts/` 下的脚本并保留改动（那是唯一源头），不要在 /tmp 另起炉灶
 
-```python
-#!/usr/bin/env python3
-"""Literature Organizer with Classification."""
-
-import re, shutil
-from pathlib import Path
-import PyPDF2
-
-PDF_DIR = Path("TARGET_DIRECTORY_HERE")
-
-def extract_text(pdf, n=3):
-    try:
-        with open(pdf, 'rb') as f:
-            r = PyPDF2.PdfReader(f)
-            return "\n".join((p.extract_text() or "") for i, p in enumerate(r.pages) if i < n)
-    except: return ""
-
-def classify(text, title):
-    """按优先级分类，避免类别冲突。"""
-    t = text.lower(); tl = title.lower()
-    # 期刊判断
-    if "phytochemistry" in t[:500] or "fitoterapia" in t[:500]:
-        return "08_植物化学与分离"
-    # 天然产物
-    if any(k in t for k in ["triterpenoid","schinortriterpenoid","schisandraceae"]):
-        return "07_天然产物全合成"
-    # IDPi
-    if "idpi" in t: return "04_IDPi_Bronsted酸催化"
-    # SOMO
-    if "somo activation" in t: return "03_有机催化_胺催化"
-    # 有机催化
-    if any(k in t for k in ["organocatalysis","organocatalyst","enamine catalysis","iminium catalysis"]):
-        return "03_有机催化_胺催化"
-    # 烯丙基化（标题优先）
-    if any(k in tl for k in ["sakurai","allylation","hosomi"]):
-        return "05_烯丙基化与Sakurai反应"
-    if sum(t.count(k) for k in ["allylation","sakurai","hosomi","allylsilane"]) >= 3:
-        return "05_烯丙基化与Sakurai反应"
-    # 环化
-    if any(k in tl for k in ["carboannulation","cycloaddition","spirooxindole","diels-alder"]):
-        return "06_环化与成环反应"
-    # Lewis酸
-    if any(k in t for k in ["oxazaborolidine","chiral lewis acid","scandium catalyst","copper catalyst"]):
-        return "02_Lewis酸催化"
-    # 综述
-    if any(k in tl for k in ["total synthesis","journey","review","perspective"]):
-        return "01_基础综述与概念"
-    # 机理
-    if "bromodemetalation" in t: return "09_反应机理与立体化学"
-    return "01_基础综述与概念"
-
-# 执行分类
-for pdf in sorted(PDF_DIR.glob("**/*.pdf")):
-    if "元数据" in str(pdf): continue
-    text = extract_text(pdf)
-    title = ""
-    for line in text.split('\n'):
-        line = line.strip()
-        skip = ['received','published','doi:','copyright','abstract','corresponding','e-mail']
-        if 15 < len(line) < 200 and not any(s in line.lower() for s in skip):
-            if line != line.upper() and line != line.lower():
-                title = line; break
-    cat = classify(text, title)
-    dst = PDF_DIR / cat / pdf.name
-    (PDF_DIR / cat).mkdir(exist_ok=True)
-    if pdf.parent.resolve() != (PDF_DIR / cat).resolve() and not dst.exists():
-        shutil.move(str(pdf), str(dst))
-        print(f"[{cat:30s}] {pdf.name[:50]}")
-```
+Phase 1 提取规则与 Phase 2 分类体系是**参考知识**（供理解与改造用）；可执行逻辑一律以 `scripts/` 为准。
 
 ---
 
 ## 自定义指南
 
+所有改造都在 `scripts/` 下进行（唯一源头），改完提交回仓库。
+
 ### 修改分类关键词
 
-编辑 `CATEGORIES` 字典，添加/删除类别和关键词。关键词应为小写。
+Phase 2 的 `CATEGORIES` 字典是参考知识；要让分类可执行，在 `scripts/rename.py` 中加入该逻辑（重命名时顺带移动到分类目录）。关键词应为小写。
 
 ### 修改目标目录
 
-修改脚本顶部 `PDF_DIR = Path("...")` 为目标路径。
+用命令行参数，不要改代码：`download.py --out <目录>`、`rename.py --dir <目录>`。
 
 ### 修改命名格式
 
-修改 `new_name = f"..."` 模板。例如：
+改 `scripts/rename.py` 中 `rename_one()` 的 `new_name = f"..."` 模板。例如：
 - `{year}_{author}_{title}.pdf` （省略期刊）
 - `{author}-{year}-{journal}-{title}.pdf` （用连字符分隔）
 

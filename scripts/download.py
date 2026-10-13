@@ -93,9 +93,12 @@ def extract_pdf_url(html: str, base_url: str):
     return urljoin(base_url, m.group(1)) if m else None
 
 
-def scihub_fetch(doi):
+def scihub_fetch(doi, year=None):
     """Try Sci-Hub mirrors. Returns (pdf_bytes, source) or (None, reasons)."""
+    if year and int(year) >= 2023:
+        return None, "post-2021 not indexed (Sci-Hub uploads stopped), go OA"
     reasons = []
+    challenge_streak = 0
     for mirror in MIRRORS:
         try:
             body, _ = http_get(f"{mirror}/{doi}", timeout=25)
@@ -105,7 +108,12 @@ def scihub_fetch(doi):
         html = body.decode("utf-8", errors="replace")
         if is_challenge_page(html):
             reasons.append(f"{mirror}:challenge")
+            challenge_streak += 1
+            if challenge_streak >= 3:
+                reasons.append("ip-rate-limited(3x challenge), skip rest")
+                break
             continue
+        challenge_streak = 0
         pdf_url = extract_pdf_url(html, mirror)
         if not pdf_url:
             reasons.append(f"{mirror}:no-link")
@@ -208,12 +216,15 @@ def download_one(doi, out_dir, sleep=1.0):
 
     print(f"[GET ] {doi}")
     meta = s2_lookup(doi)          # metadata sidecar (best-effort, keyless)
-    data, info = scihub_fetch(doi)
+    data, info = scihub_fetch(doi, year=(meta or {}).get("year"))
     if not data:
         print(f"       sci-hub miss ({info}); trying OA fallback...")
         data, info = oa_fetch(doi, meta)
     if not data:
         print(f"[FAIL] {doi}: {info}")
+        print("       next: report to user (institutional access / author "
+              "request / Unpaywall manual check); do NOT hand-roll scrapers "
+              "(SKILL.md stop rule)")
         return False
 
     with open(pdf_path, "wb") as f:
